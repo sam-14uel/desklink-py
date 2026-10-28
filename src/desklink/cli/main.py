@@ -42,9 +42,7 @@ def _load_cfg(
     config: Optional[Path],
     mcp_config: Optional[Path],
     allowed_dirs: Optional[list[str]],
-) -> "DeskLinkConfig":
-    from desklink.config import DeskLinkConfig
-
+):
     cfg = load_config(config_path=config, mcp_path=mcp_config)
     if allowed_dirs:
         dirs = [Path(d).resolve() for d in allowed_dirs]
@@ -66,11 +64,7 @@ def start(
     token: Optional[str] = typer.Option(None, "--token"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
-    """Start the MCP bridge and tunnel.
-
-    If no mcp.json is found, a default official filesystem server is used
-    (backward compatible with the previous --dir behaviour).
-    """
+    """Start the MCP bridge and tunnel."""
     cfg = _load_cfg(config, mcp_config, allowed_dirs)
 
     if port:
@@ -165,52 +159,36 @@ def tools(
 @app.command()
 def call(
     tool_name: str = typer.Argument(..., help="Namespaced tool name, e.g. filesystem__list_directory"),
-    args: Optional[str] = typer.Option(
-        None,
-        "--args",
-        "-a",
-        help="JSON object of arguments. On Windows use double quotes: --args \"{\\\"path\\\":\\\"C:\\\\Users\\\\User\\\"}\"",
-    ),
-    arg: Optional[list[str]] = typer.Option(
-        None,
-        "--arg",
-        "-A",
-        help="Single argument as key=value (repeatable). Safer on Windows than JSON.",
-    ),
+    args: Optional[str] = typer.Option(None, "--args", "-a", help="JSON object of arguments"),
+    arg: Optional[list[str]] = typer.Option(None, "--arg", "-A", help="Single argument as key=value (repeatable). Safer on Windows."),
     mcp_config: Optional[Path] = typer.Option(None, "--mcp-config", help="Path to mcp.json"),
     config: Optional[Path] = typer.Option(None, "--config", help="Path to desklink.config.json"),
-    allowed_dirs: Optional[list[str]] = typer.Option(
-        None, "--dir", "-d", help="Allowed directory for default filesystem server"
-    ),
+    allowed_dirs: Optional[list[str]] = typer.Option(None, "--dir", "-d", help="Allowed directory for default filesystem server"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """Call a tool by its namespaced name and print the result (for testing).
 
     Examples:
       desklink call filesystem__list_directory --arg path=C:\\Users\\User\\Desktop
-      desklink call filesystem__list_directory --args \"{\\\"path\\\":\\\"C:\\\\Users\\\\User\\\\Desktop\\\"}\"
+      desklink call filesystem__list_allowed_directories
     """
     cfg = _load_cfg(config, mcp_config, allowed_dirs)
     setup_logging(verbose, cfg.settings.logging.level)
 
     arguments: dict = {}
 
-    # Prefer repeatable --arg key=value (Windows-friendly)
     if arg:
         for item in arg:
             if "=" not in item:
                 console.print(f"[red]Invalid --arg (expected key=value):[/red] {item}")
                 raise typer.Exit(1)
             key, value = item.split("=", 1)
-            # Try to parse value as JSON (numbers, bools, objects); fall back to string
             try:
                 arguments[key] = json.loads(value)
             except Exception:
                 arguments[key] = value
 
-    # Also accept a full JSON object via --args
     if args:
-        # Allow @file.json to read arguments from a file (avoids quoting issues)
         raw = args
         if args.startswith("@"):
             try:
@@ -226,4 +204,63 @@ def call(
         except Exception as e:
             console.print(f"[red]Invalid --args JSON:[/red] {e}")
             console.print("[dim]Tip (Windows): use --arg path=C:\\Users\\User\\Desktop[/dim]")
-            console.print('[dim]Or double quotes: --args \
+            raise typer.Exit(1)
+
+    async def _call():
+        bridge = McpBridge(cfg)
+        try:
+            await bridge.start_servers()
+            match = next((t for t in bridge.tools if t["namespaced"] == tool_name), None)
+            if not match:
+                available = ", ".join(t["namespaced"] for t in bridge.tools[:10])
+                console.print(f"[red]Tool '{tool_name}' not found.[/red]")
+                console.print(f"Available (first 10): {available}")
+                raise typer.Exit(1)
+
+            session = bridge.sessions.get(match["server"])
+            if not session:
+                console.print("[red]No active session for server[/red]")
+                raise typer.Exit(1)
+
+            console.print(f"[cyan]Calling[/cyan] {tool_name} with {arguments}")
+            result = await session.call_tool(match["name"], arguments)
+            console.print("\n[green]Result:[/green]")
+            if hasattr(result, "content"):
+                for item in result.content:
+                    if hasattr(item, "text"):
+                        console.print(item.text)
+                    else:
+                        console.print(item)
+            else:
+                console.print(result)
+        finally:
+            await bridge.close()
+
+    asyncio.run(_call())
+
+
+@app.command()
+def status():
+    """Show current DeskLink status (MVP: placeholder)."""
+    console.print("Status command not fully implemented yet. Use 'desklink start'.")
+
+
+@app.command()
+def config_cmd(
+    config: Optional[Path] = typer.Option(None, "--config"),
+    mcp_config: Optional[Path] = typer.Option(None, "--mcp-config"),
+):
+    """Show current configuration."""
+    cfg = load_config(config_path=config, mcp_path=mcp_config)
+    console.print_json(cfg.model_dump_json(indent=2))
+
+
+app.command(name="config")(config_cmd)
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
