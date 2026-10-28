@@ -1,0 +1,28 @@
+{
+  "logging": {
+    "level": "info"
+  },
+  "tracing": {
+    "enabled": true,
+    "level": "basic",
+    "redact_sensitive": true
+  },
+  "auth": {
+    "enabled": true
+  },
+  "approvals": {
+    "default": "auto",
+    "tools": {
+      "filesystem__write_file": "prompt",
+      "filesystem__create_directory": "prompt"
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "mcp_path": "/mcp"
+  },
+  "tunnel": {
+    "provider": "ngrok"
+  }
+}

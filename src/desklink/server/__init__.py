@@ -1,7 +1,7 @@
 """DeskLink MCP server orchestration.
 
-Starts the filesystem MCP server over Streamable HTTP, applies auth, and
-coordinates with the tunnel.
+Starts a proxy Streamable HTTP server that aggregates tools from local STDIO
+MCP servers (defined in mcp.json), applies auth, and coordinates with the tunnel.
 """
 
 import asyncio
@@ -17,8 +17,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from desklink.bridge import McpBridge
 from desklink.config import DeskLinkConfig
-from desklink.filesystem import create_filesystem_server
 from desklink.models import ServerStatus
 from desklink.tunnel import get_tunnel_provider
 
@@ -54,48 +54,40 @@ class BearerAuthMiddleware:
 
 
 class DeskLinkServer:
-    """Manages the local MCP HTTP server and tunnel lifecycle."""
+    """Manages the local MCP HTTP proxy server and tunnel lifecycle."""
 
     def __init__(self, config: DeskLinkConfig):
         self.config = config
-        self.filesystem_mcp: Optional[FastMCP] = None
+        self.bridge: Optional[McpBridge] = None
+        self.proxy_mcp: Optional[FastMCP] = None
         self.app: Optional[Starlette] = None
         self.server: Optional[uvicorn.Server] = None
         self.tunnel = None
         self.status = ServerStatus()
         self._shutdown_event = asyncio.Event()
 
-    def build_mcp(self) -> FastMCP:
-        """Create the filesystem MCP server."""
-        self.filesystem_mcp = create_filesystem_server(
-            self.config.filesystem.allowed_directories,
-            read_only=self.config.filesystem.read_only,
-        )
-        return self.filesystem_mcp
-
     async def start_http_server(self) -> str:
-        """Start the Streamable HTTP server and return the local URL."""
-        mcp = self.build_mcp()
+        """Start the Streamable HTTP proxy and return the local URL."""
+        self.bridge = McpBridge(self.config)
+        await self.bridge.start_servers()
+        self.proxy_mcp = self.bridge.build_proxy_server()
 
         middleware = []
-        if self.config.auth.enabled and self.config.auth.token:
+        if self.config.settings.auth.enabled and self.config.settings.auth.token:
             middleware.append(
-                Middleware(BearerAuthMiddleware, token=self.config.auth.token)
+                Middleware(BearerAuthMiddleware, token=self.config.settings.auth.token)
             )
 
         # Must run the session manager in the host app lifespan.
         # Mounting streamable_http_app() alone does not start it (known MCP SDK issue).
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette):
-            async with mcp.session_manager.run():
+            async with self.proxy_mcp.session_manager.run():
                 yield
 
-        # FastMCP's streamable_http_app serves at its configured streamable_http_path
-        # (default /mcp). We mount the app at root so the public endpoint is
-        # http://host:port/mcp .
         self.app = Starlette(
             routes=[
-                Mount("/", app=mcp.streamable_http_app()),
+                Mount("/", app=self.proxy_mcp.streamable_http_app()),
             ],
             middleware=middleware,
             lifespan=lifespan,
@@ -103,8 +95,8 @@ class DeskLinkServer:
 
         config = uvicorn.Config(
             self.app,
-            host=self.config.server.host,
-            port=self.config.server.port,
+            host=self.config.settings.server.host,
+            port=self.config.settings.server.port,
             log_level="warning",
             access_log=False,
         )
@@ -113,7 +105,6 @@ class DeskLinkServer:
         loop = asyncio.get_event_loop()
         loop.create_task(self.server.serve())
 
-        # Wait until ready
         for _ in range(60):
             if getattr(self.server, "started", False):
                 break
@@ -122,44 +113,36 @@ class DeskLinkServer:
             raise RuntimeError("HTTP server failed to start within timeout")
 
         local_url = (
-            f"http://{self.config.server.host}:{self.config.server.port}{self.config.server.mcp_path}"
+            f"http://{self.config.settings.server.host}:{self.config.settings.server.port}"
+            f"{self.config.settings.server.mcp_path}"
         )
         self.status.local_url = local_url
         self.status.running = True
-        logger.info("Local MCP server listening at %s", local_url)
+        self.status.tools_count = len(self.bridge.tools)
+        logger.info(
+            "Local MCP bridge listening at %s (%d tools)", local_url, self.status.tools_count
+        )
         return local_url
 
     def start_tunnel(self) -> str:
         """Establish the public tunnel and return the public MCP URL."""
-        provider = get_tunnel_provider(self.config.tunnel.provider)
+        provider = get_tunnel_provider(self.config.settings.tunnel.provider)
         info = provider.start(
-            self.config.server.port,
-            authtoken=self.config.tunnel.authtoken,
+            self.config.settings.server.port,
+            authtoken=self.config.settings.tunnel.authtoken,
         )
         self.tunnel = provider
-        public_mcp = info.public_url.rstrip("/") + self.config.server.mcp_path
+        public_mcp = info.public_url.rstrip("/") + self.config.settings.server.mcp_path
         self.status.public_url = public_mcp
         logger.info("Public MCP endpoint: %s", public_mcp)
         return public_mcp
 
     async def run(self) -> None:
-        """Start everything and block until shutdown."""
+        """Start everything and block until shutdown. Prefer calling start_* from CLI for better UX."""
         try:
-            local = await self.start_http_server()
-            public = self.start_tunnel()
-
-            # Count tools
-            if self.filesystem_mcp:
-                try:
-                    tools = self.filesystem_mcp.list_tools()
-                    self.status.tools_count = len(list(tools))
-                except Exception:
-                    self.status.tools_count = 5  # fallback estimate
-
-            self.status.auth_enabled = self.config.auth.enabled
-            self.status.allowed_directories = self.config.filesystem.allowed_directories
-
-            # Keep running until shutdown
+            await self.start_http_server()
+            self.start_tunnel()
+            self.status.auth_enabled = self.config.settings.auth.enabled
             await self._shutdown_event.wait()
         finally:
             await self.shutdown()
@@ -170,6 +153,8 @@ class DeskLinkServer:
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         logger.info("Shutting down DeskLink...")
+        if self.bridge:
+            await self.bridge.close()
         if self.tunnel:
             try:
                 self.tunnel.stop()
