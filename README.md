@@ -2,44 +2,69 @@
 
 Turn your local computer into a remotely accessible **MCP endpoint** for cloud AI agents.
 
-DeskLink runs a secure local filesystem MCP server (Streamable HTTP) and exposes it through a temporary public tunnel (ngrok by default) so tools like Grok, Claude, or Cursor can access permitted directories on your machine.
+DeskLink is a thin authenticated bridge: it loads local MCP servers (especially STDIO servers defined in a standard `mcp.json`), discovers their tools, and exposes all of them through a single Streamable HTTP URL (optionally tunnelled with ngrok).
 
 ## Quick start
 
 ```bash
 pip install desklink
-# Optional: export NGROK_AUTHTOKEN=your_token   # required for free ngrok
+# Optional: export NGROK_AUTHTOKEN=your_token
+
+# Option A: use a standard mcp.json (recommended)
+# See examples/mcp.json — uses the official @modelcontextprotocol/server-filesystem
+desklink start --mcp-config ./mcp.json
+
+# Option B: no config → default official filesystem server (home directory)
 desklink start
+
+# Or specify directories for the default filesystem server
+desklink start --dir ~/Documents --dir ~/Projects
 ```
 
 Example output:
 
 ```
-┌────────────────┐
-│ DeskLink v0.1.0 │
-└────────────────┘
+┌─────────────────┐
+│ DeskLink v0.2.0 │
+└─────────────────┘
 
-✓ Filesystem MCP started
+✓ MCP bridge started
 ✓ Local MCP: http://127.0.0.1:8765/mcp
 ✓ Tunnel connected
 
 Remote MCP endpoint:
 https://abc123.ngrok-free.app/mcp
 
+Auth token: ...
+Include as Authorization: Bearer <token> when connecting.
+
 Status: ● Connected
-Tools: 5
+Tools: 14
+Servers: 1
 
 Press Ctrl+C to stop.
 ```
 
-Connect your MCP client to the printed remote URL and include the Authorization header shown.
+Connect any MCP client to the printed remote URL and include the Authorization header.
+
+## Configuration
+
+- **mcp.json** — standard MCP server definitions (command + args). DeskLink spawns them as STDIO processes.
+- **desklink.config.json** — DeskLink settings:
+  - logging level
+  - tracing (basic/full, redaction)
+  - authentication (bearer token)
+  - tool-call approval policies (`auto` or `prompt` per tool)
+  - server bind address/port
+  - tunnel provider
+
+See `examples/` for samples. Environment variables (`DESKLINK_*`, `NGROK_AUTHTOKEN`) and CLI flags override files.
 
 ## Security
 
-- Filesystem tools are restricted to explicitly allowed directories.
-- A random Bearer token is generated (or reused) and required for all requests.
-- Token is stored with restricted permissions in `~/.desklink/token`.
-- DNS rebinding protection is disabled so public tunnels work; the Bearer token is the primary control.
+- Bearer token required (generated and stored in `~/.desklink/token` by default).
+- Optional per-tool approval prompts before execution.
+- Filesystem access is controlled by the underlying MCP servers you configure (the official filesystem server respects its allowed directories).
 
 ## Development
 
@@ -49,4 +74,4 @@ uv run desklink start --tunnel none
 uv run pytest
 ```
 
-See `ARCHITECTURE.md` for module layout.
+The architecture is modular so additional tunnel providers, stronger auth, and DeskLink Cloud features can be added later without changing the core bridge.
