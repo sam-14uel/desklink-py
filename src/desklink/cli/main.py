@@ -3,9 +3,11 @@
 Primary command: desklink start
 
 Supports mcp.json for local STDIO servers and desklink.config.json for settings.
+Also provides tools listing and direct tool invocation for testing.
 """
 
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -15,9 +17,11 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 
 from desklink import __version__
 from desklink.auth import load_or_create_token
+from desklink.bridge import McpBridge
 from desklink.config import ensure_default_filesystem, load_config
 from desklink.server import DeskLinkServer
 
@@ -32,6 +36,22 @@ def setup_logging(verbose: bool = False, level: Optional[str] = None) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def _load_cfg(
+    config: Optional[Path],
+    mcp_config: Optional[Path],
+    allowed_dirs: Optional[list[str]],
+) -> "DeskLinkConfig":
+    from desklink.config import DeskLinkConfig
+
+    cfg = load_config(config_path=config, mcp_path=mcp_config)
+    if allowed_dirs:
+        dirs = [Path(d).resolve() for d in allowed_dirs]
+        cfg = ensure_default_filesystem(cfg, dirs)
+    else:
+        cfg = ensure_default_filesystem(cfg)
+    return cfg
 
 
 @app.command()
@@ -51,13 +71,7 @@ def start(
     If no mcp.json is found, a default official filesystem server is used
     (backward compatible with the previous --dir behaviour).
     """
-    cfg = load_config(config_path=config, mcp_path=mcp_config)
-
-    if allowed_dirs:
-        dirs = [Path(d).resolve() for d in allowed_dirs]
-        cfg = ensure_default_filesystem(cfg, dirs)
-    else:
-        cfg = ensure_default_filesystem(cfg)
+    cfg = _load_cfg(config, mcp_config, allowed_dirs)
 
     if port:
         cfg.settings.server.port = port
@@ -112,6 +126,108 @@ def start(
     finally:
         asyncio.run(server.shutdown())
         console.print("[green]DeskLink stopped.[/]")
+
+
+@app.command()
+def tools(
+    mcp_config: Optional[Path] = typer.Option(None, "--mcp-config", help="Path to mcp.json"),
+    config: Optional[Path] = typer.Option(None, "--config", help="Path to desklink.config.json"),
+    allowed_dirs: Optional[list[str]] = typer.Option(
+        None, "--dir", "-d", help="Allowed directory for default filesystem server"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """List tools discovered from configured MCP servers (no tunnel started)."""
+    cfg = _load_cfg(config, mcp_config, allowed_dirs)
+    setup_logging(verbose, cfg.settings.logging.level)
+
+    async def _list():
+        bridge = McpBridge(cfg)
+        try:
+            await bridge.start_servers()
+            if not bridge.tools:
+                console.print("[yellow]No tools discovered.[/yellow]")
+                return
+            table = Table(title="Discovered MCP Tools")
+            table.add_column("Namespaced Name", style="cyan")
+            table.add_column("Server")
+            table.add_column("Description")
+            for t in bridge.tools:
+                table.add_row(t["namespaced"], t["server"], (t["description"] or "")[:80])
+            console.print(table)
+            console.print(f"\n[dim]Total: {len(bridge.tools)} tools from {len(cfg.mcp.mcpServers)} server(s)[/dim]")
+        finally:
+            await bridge.close()
+
+    asyncio.run(_list())
+
+
+@app.command()
+def call(
+    tool_name: str = typer.Argument(..., help="Namespaced tool name, e.g. filesystem__list_directory"),
+    args: Optional[str] = typer.Option(
+        None, "--args", "-a", help="JSON object of arguments, e.g. '{\"path\":\"/tmp\"}'"
+    ),
+    mcp_config: Optional[Path] = typer.Option(None, "--mcp-config", help="Path to mcp.json"),
+    config: Optional[Path] = typer.Option(None, "--config", help="Path to desklink.config.json"),
+    allowed_dirs: Optional[list[str]] = typer.Option(
+        None, "--dir", "-d", help="Allowed directory for default filesystem server"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """Call a tool by its namespaced name and print the result (for testing).
+
+    Example:
+      desklink call filesystem__list_directory --args '{\"path\": \"/tmp\"}'
+    """
+    cfg = _load_cfg(config, mcp_config, allowed_dirs)
+    setup_logging(verbose, cfg.settings.logging.level)
+
+    arguments: dict = {}
+    if args:
+        try:
+            arguments = json.loads(args)
+            if not isinstance(arguments, dict):
+                raise ValueError("args must be a JSON object")
+        except Exception as e:
+            console.print(f"[red]Invalid --args JSON:[/red] {e}")
+            raise typer.Exit(1)
+
+    async def _call():
+        bridge = McpBridge(cfg)
+        try:
+            await bridge.start_servers()
+            # Find matching tool
+            match = next((t for t in bridge.tools if t["namespaced"] == tool_name), None)
+            if not match:
+                available = ", ".join(t["namespaced"] for t in bridge.tools[:10])
+                console.print(f"[red]Tool '{tool_name}' not found.[/red]")
+                console.print(f"Available (first 10): {available}")
+                raise typer.Exit(1)
+
+            # Call via the underlying session (bypasses approval for testing convenience;
+            # approvals still apply when going through the HTTP bridge)
+            session = bridge.sessions.get(match["server"])
+            if not session:
+                console.print("[red]No active session for server[/red]")
+                raise typer.Exit(1)
+
+            console.print(f"[cyan]Calling[/cyan] {tool_name} with {arguments}")
+            result = await session.call_tool(match["name"], arguments)
+            console.print("\n[green]Result:[/green]")
+            # Pretty-print common MCP result shapes
+            if hasattr(result, "content"):
+                for item in result.content:
+                    if hasattr(item, "text"):
+                        console.print(item.text)
+                    else:
+                        console.print(item)
+            else:
+                console.print(result)
+        finally:
+            await bridge.close()
+
+    asyncio.run(_call())
 
 
 @app.command()
