@@ -151,14 +151,31 @@ class McpBridge:
         for tool in self.tools:
             ns_name = tool["namespaced"]
             desc = tool["description"] or f"Proxied tool from {tool['server']}"
+            original_schema = tool.get("inputSchema") or {"type": "object", "properties": {}}
 
             def make_handler(name: str):
                 async def handler(**kwargs: Any) -> Any:
-                    return await proxy.call(name, kwargs)
+                    # FastMCP registers **kwargs tools with a synthetic "kwargs" parameter.
+                    # Clients therefore send {"kwargs": {...real args...}}. Unwrap when present.
+                    if (
+                        "kwargs" in kwargs
+                        and isinstance(kwargs["kwargs"], dict)
+                        and len(kwargs) == 1
+                    ):
+                        arguments = kwargs["kwargs"]
+                    else:
+                        arguments = kwargs
+                    return await proxy.call(name, arguments)
 
                 return handler
 
             mcp.tool(name=ns_name, description=desc)(make_handler(ns_name))
+
+            # Overwrite the generated schema with the original tool schema so clients
+            # see the real parameters (path, etc.) instead of a kwargs wrapper.
+            registered = mcp._tool_manager._tools.get(ns_name)
+            if registered is not None and original_schema:
+                registered.parameters = original_schema
 
         return mcp
 
