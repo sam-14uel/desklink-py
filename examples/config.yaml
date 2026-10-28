@@ -1,0 +1,23 @@
+# Example DeskLink configuration
+# Copy to ~/.desklink/config.yaml and adjust as needed.
+# Environment variables (DESKLINK_*) override these values.
+
+filesystem:
+  allowed_directories:
+    - ~/Documents
+    - ~/projects
+  read_only: false
+
+tunnel:
+  provider: ngrok
+  # authtoken: set via NGROK_AUTHTOKEN env var
+  region: null
+
+auth:
+  enabled: true
+  # token: auto-generated and stored in ~/.desklink/token if omitted
+
+server:
+  host: 127.0.0.1
+  port: 8765
+  mcp_path: /mcp
